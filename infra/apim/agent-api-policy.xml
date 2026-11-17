@@ -1,0 +1,122 @@
+<!--
+  Unified AI FinOps - per-user metering for Foundry agents.
+  Placeholders {{TENANT_ID}} and {{GATEWAY_APP_ID}} are replaced by scripts/configure_apim.py.
+  Each call emits one trace record (source "unified-ai-finops") that lands in
+  ApiManagementGatewayLogs.TraceRecords in Log Analytics.
+  Logs identity and usage metadata, never prompt or completion content.
+-->
+<policies>
+    <inbound>
+        <base />
+        <validate-azure-ad-token tenant-id="{{TENANT_ID}}" header-name="Authorization" failed-validation-httpcode="401" failed-validation-error-message="A signed-in Microsoft Entra user token for the Unified AI FinOps gateway is required." output-token-variable-name="jwt">
+            <audiences>
+                <audience>{{GATEWAY_APP_ID}}</audience>
+                <audience>api://{{GATEWAY_APP_ID}}</audience>
+            </audiences>
+            <required-claims>
+                <claim name="scp" match="any" separator=" ">
+                    <value>user_impersonation</value>
+                </claim>
+            </required-claims>
+        </validate-azure-ad-token>
+        <set-variable name="user-oid" value="@(((Jwt)context.Variables["jwt"]).Claims.GetValueOrDefault("oid", ""))" />
+        <set-variable name="user-tid" value="@(((Jwt)context.Variables["jwt"]).Claims.GetValueOrDefault("tid", ""))" />
+        <set-variable name="user-upn" value="@{
+            var jwt = (Jwt)context.Variables["jwt"];
+            var upn = jwt.Claims.GetValueOrDefault("preferred_username", "");
+            return string.IsNullOrEmpty(upn) ? jwt.Claims.GetValueOrDefault("upn", "") : upn;
+        }" />
+        <set-variable name="user-name" value="@(((Jwt)context.Variables["jwt"]).Claims.GetValueOrDefault("name", ""))" />
+        <set-variable name="client-app-id" value="@(((Jwt)context.Variables["jwt"]).Claims.GetValueOrDefault("azp", ""))" />
+        <choose>
+            <when condition="@(string.IsNullOrEmpty((string)context.Variables["user-oid"]))">
+                <return-response>
+                    <set-status code="401" reason="Unauthorized" />
+                    <set-body>{"error":"A user identity (oid claim) is required."}</set-body>
+                </return-response>
+            </when>
+        </choose>
+        <set-variable name="agent-name" value="@(context.Request.MatchedParameters["agent"])" />
+        <choose>
+            <when condition="@(!System.Text.RegularExpressions.Regex.IsMatch((string)context.Variables["agent-name"], "^[A-Za-z0-9][A-Za-z0-9-]{0,62}$"))">
+                <return-response>
+                    <set-status code="400" reason="Bad Request" />
+                    <set-body>{"error":"Invalid agent name."}</set-body>
+                </return-response>
+            </when>
+        </choose>
+        <set-body>@{
+            var body = context.Request.Body.As<JObject>(preserveContent: true) ?? new JObject();
+            body.Remove("stream");
+            body.Remove("model");
+            body.Remove("agent");
+            body["agent_reference"] = new JObject(
+                new JProperty("name", (string)context.Variables["agent-name"]),
+                new JProperty("type", "agent_reference"));
+            return body.ToString(Newtonsoft.Json.Formatting.None);
+        }</set-body>
+        <set-header name="Authorization" exists-action="delete" />
+        <authentication-managed-identity resource="https://ai.azure.com" />
+        <rewrite-uri template="/responses" copy-unmatched-params="false" />
+    </inbound>
+    <backend>
+        <forward-request timeout="120" buffer-request-body="true" />
+    </backend>
+    <outbound>
+        <base />
+        <trace source="unified-ai-finops" severity="information">
+            <message>@{
+                JObject resp = null;
+                try { resp = context.Response.Body.As<JObject>(preserveContent: true); } catch { resp = null; }
+                var agent = resp == null ? null : resp["agent_reference"] ?? resp["agent"];
+                var record = new JObject(
+                    new JProperty("event", "ai_usage"),
+                    new JProperty("schema_version", 1),
+                    new JProperty("apim_request_id", context.RequestId.ToString()),
+                    new JProperty("event_time", DateTime.UtcNow.ToString("o")),
+                    new JProperty("ecosystem", "foundry"),
+                    new JProperty("source_system", "apim"),
+                    new JProperty("tenant_id", (string)context.Variables["user-tid"]),
+                    new JProperty("user_oid", (string)context.Variables["user-oid"]),
+                    new JProperty("user_upn", (string)context.Variables["user-upn"]),
+                    new JProperty("user_name", (string)context.Variables["user-name"]),
+                    new JProperty("client_app_id", (string)context.Variables["client-app-id"]),
+                    new JProperty("agent_name", (string)context.Variables["agent-name"]),
+                    new JProperty("agent_version", agent == null || agent["version"] == null ? "" : (string)agent["version"]),
+                    new JProperty("model", resp == null || resp["model"] == null ? "" : (string)resp["model"]),
+                    new JProperty("response_id", resp == null || resp["id"] == null ? "" : (string)resp["id"]),
+                    new JProperty("status_code", context.Response.StatusCode),
+                    new JProperty("input_tokens", resp == null ? 0L : ((long?)resp.SelectToken("usage.input_tokens") ?? 0L)),
+                    new JProperty("output_tokens", resp == null ? 0L : ((long?)resp.SelectToken("usage.output_tokens") ?? 0L)),
+                    new JProperty("total_tokens", resp == null ? 0L : ((long?)resp.SelectToken("usage.total_tokens") ?? 0L)),
+                    new JProperty("cached_tokens", resp == null ? 0L : ((long?)resp.SelectToken("usage.input_tokens_details.cached_tokens") ?? 0L)),
+                    new JProperty("reasoning_tokens", resp == null ? 0L : ((long?)resp.SelectToken("usage.output_tokens_details.reasoning_tokens") ?? 0L)));
+                return record.ToString(Newtonsoft.Json.Formatting.None);
+            }</message>
+            <metadata name="event" value="ai_usage" />
+        </trace>
+        <set-header name="x-aifinops-request-id" exists-action="override">
+            <value>@(context.RequestId.ToString())</value>
+        </set-header>
+    </outbound>
+    <on-error>
+        <base />
+        <trace source="unified-ai-finops" severity="information">
+            <message>@{
+                var record = new JObject(
+                    new JProperty("event", "ai_usage_error"),
+                    new JProperty("schema_version", 1),
+                    new JProperty("apim_request_id", context.RequestId.ToString()),
+                    new JProperty("event_time", DateTime.UtcNow.ToString("o")),
+                    new JProperty("user_oid", context.Variables.GetValueOrDefault<string>("user-oid", "")),
+                    new JProperty("user_upn", context.Variables.GetValueOrDefault<string>("user-upn", "")),
+                    new JProperty("agent_name", context.Variables.GetValueOrDefault<string>("agent-name", "")),
+                    new JProperty("status_code", context.Response == null ? 0 : context.Response.StatusCode),
+                    new JProperty("error_source", context.LastError == null ? "" : context.LastError.Source),
+                    new JProperty("error_reason", context.LastError == null ? "" : context.LastError.Reason));
+                return record.ToString(Newtonsoft.Json.Formatting.None);
+            }</message>
+            <metadata name="event" value="ai_usage_error" />
+        </trace>
+    </on-error>
+</policies>

@@ -1,0 +1,32 @@
+{
+  "name": "personal-ai-usage",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Synthetic-only personal AI usage dashboard backed by Microsoft Fabric.",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "test": "node --test tests/*.test.ts",
+    "preview": "vite preview --host 127.0.0.1",
+    "rayfin": "rayfin"
+  },
+  "dependencies": {
+    "@microsoft/rayfin-auth-provider-fabric": "1.36.2",
+    "@microsoft/rayfin-client": "^1.36.2",
+    "@microsoft/rayfin-core": "^1.36.2",
+    "@microsoft/rayfin-data": "^1.36.2"
+  },
+  "devDependencies": {
+    "@microsoft/rayfin-cli": "^1.36.2",
+    "@types/node": "^24.0.0",
+    "node": "^24.0.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.0"
+  },
+  "overrides": {
+    "@microsoft/rayfin-tools-common": {
+      "zod": "4.6.6"
+    }
+  }
+}
